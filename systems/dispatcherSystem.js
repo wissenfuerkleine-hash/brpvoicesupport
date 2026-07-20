@@ -4,12 +4,12 @@ const {
   ButtonStyle,
   EmbedBuilder,
 } = require('discord.js');
+const mongoose = require('mongoose');
 const config = require('../config');
 const queueSystem = require('./queueSystem');
 const audioSystem = require('./audioSystem');
-const Session = require('../models/Session');
-const Stats = require('../models/Stats');
-const Settings = require('../models/Settings');
+
+function dbReady() { return mongoose.connection.readyState === 1; }
 
 // roomId → session data
 const activeRooms = new Map();
@@ -38,8 +38,14 @@ function getRoomStatuses() {
 }
 
 async function getDispatchDelay() {
-  const delay = await Settings.get('dispatchDelay', config.DISPATCH_DELAY);
-  return Number(delay);
+  if (dbReady()) {
+    try {
+      const Settings = require('../models/Settings');
+      const delay = await Settings.get('dispatchDelay', config.DISPATCH_DELAY);
+      return Number(delay);
+    } catch {}
+  }
+  return config.DISPATCH_DELAY;
 }
 
 function hasSupporterOnline(guild) {
@@ -101,13 +107,21 @@ async function moveCitizenToRoom(guild, citizen, supportRoom, supporter) {
     active: true,
   };
   activeRooms.set(supportRoom.id, sessionData);
-  await Session.create(sessionData);
 
-  await Stats.findOneAndUpdate(
-    { supporterId: supporter.id },
-    { supporterName: supporter.user.username, $inc: { totalSessions: 1 }, lastActive: new Date() },
-    { upsert: true }
-  );
+  if (dbReady()) {
+    try {
+      const Session = require('../models/Session');
+      const Stats = require('../models/Stats');
+      await Session.create(sessionData);
+      await Stats.findOneAndUpdate(
+        { supporterId: supporter.id },
+        { supporterName: supporter.user.username, $inc: { totalSessions: 1 }, lastActive: new Date() },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.error('[Dispatcher] DB write error:', err.message);
+    }
+  }
 
   await queueSystem.remove(citizen.id);
   await sendLog(guild, '🟢', `Übernommen — ${citizen.user.username} → ${supporter.user.username}`);
@@ -432,14 +446,22 @@ async function endSupport(roomId, guild) {
     }
 
     const duration = Date.now() - new Date(session.startedAt).getTime();
-    await Session.findOneAndUpdate(
-      { roomId, supporterId: session.supporterId, active: true },
-      { endedAt: new Date(), active: false }
-    );
-    await Stats.findOneAndUpdate(
-      { supporterId: session.supporterId },
-      { $inc: { totalTime: duration }, lastActive: new Date() }
-    );
+    if (dbReady()) {
+      try {
+        const Session = require('../models/Session');
+        const Stats = require('../models/Stats');
+        await Session.findOneAndUpdate(
+          { roomId, supporterId: session.supporterId, active: true },
+          { endedAt: new Date(), active: false }
+        );
+        await Stats.findOneAndUpdate(
+          { supporterId: session.supporterId },
+          { $inc: { totalTime: duration }, lastActive: new Date() }
+        );
+      } catch (err) {
+        console.error('[Dispatcher] DB endSupport error:', err.message);
+      }
+    }
 
     activeRooms.delete(roomId);
     await sendLog(guild, '🔴', `Beendet — ${session.citizenName} (${Math.round(duration / 1000)}s)`);

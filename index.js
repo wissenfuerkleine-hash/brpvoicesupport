@@ -11,9 +11,17 @@ const apiRouter = require('./routes/api');
 const uploadRouter = require('./routes/upload');
 
 async function main() {
-  // ── MongoDB ──
-  await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/support-bot');
-  console.log('[Main] MongoDB connected.');
+  // ── MongoDB (optional) ──
+  if (process.env.MONGODB_URI) {
+    try {
+      await mongoose.connect(process.env.MONGODB_URI);
+      console.log('[Main] MongoDB connected.');
+    } catch (err) {
+      console.warn('[Main] MongoDB connection failed — running in memory-only mode:', err.message);
+    }
+  } else {
+    console.log('[Main] No MONGODB_URI set — running in memory-only mode.');
+  }
 
   // ── Express + HTTP server ──
   const app = express();
