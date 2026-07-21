@@ -1,11 +1,16 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, Collection, REST, Routes, MessageFlags } = require('discord.js');
-const fs = require('fs');
-const path = require('path');
-const config = require('./config');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+} = require('discord.js');
+
+const config      = require('./config');
 const queueSystem = require('./systems/queueSystem');
 const audioSystem = require('./systems/audioSystem');
-const dispatcher = require('./systems/dispatcherSystem');
+const dispatcher  = require('./systems/dispatcherSystem');
+
+// ── Client ────────────────────────────────────────────────────────────────────
 
 const client = new Client({
   intents: [
@@ -13,138 +18,113 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.GuildMember],
+  partials: [Partials.GuildMember, Partials.Channel, Partials.Message],
 });
 
-// Load commands
-client.commands = new Collection();
-const commandsPath = path.join(__dirname, 'commands');
-const commandFiles = fs.readdirSync(commandsPath).filter((f) => f.endsWith('.js'));
-for (const file of commandFiles) {
-  const command = require(path.join(commandsPath, file));
-  if (command.data && command.execute) {
-    client.commands.set(command.data.name, command);
-  }
-}
+dispatcher.init(client);
 
-// Register slash commands per guild (instant — no 1h propagation delay)
-async function registerCommands() {
-  const commands = client.commands.map((c) => c.data.toJSON());
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  try {
-    for (const guild of client.guilds.cache.values()) {
-      await rest.put(
-        Routes.applicationGuildCommands(process.env.CLIENT_ID, guild.id),
-        { body: commands }
-      );
-      console.log(`[Bot] Slash commands registered for guild: ${guild.name}`);
-    }
-  } catch (err) {
-    console.error('[Bot] Failed to register commands:', err.message);
-  }
-}
+// ── Ready ─────────────────────────────────────────────────────────────────────
 
-client.once('ready', async () => {
+client.once('ready', () => {
   console.log(`[Bot] Logged in as ${client.user.tag}`);
-  await registerCommands();
+  console.log(`[Bot] Watching waiting room: ${config.WAITING_ROOM_ID}`);
 });
 
-// Voice state handler
+// ── Voice state handler ───────────────────────────────────────────────────────
+
 client.on('voiceStateUpdate', async (oldState, newState) => {
-  const guild = newState.guild;
-  const member = newState.member;
+  const member = newState.member ?? oldState.member;
   if (!member || member.user.bot) return;
 
-  const joinedWaiting =
-    newState.channelId === config.WAITING_ROOM_ID &&
-    oldState.channelId !== config.WAITING_ROOM_ID;
+  const guild       = newState.guild ?? oldState.guild;
+  const joinedWait  = newState.channelId === config.WAITING_ROOM_ID && oldState.channelId !== config.WAITING_ROOM_ID;
+  const leftWait    = oldState.channelId === config.WAITING_ROOM_ID && newState.channelId !== config.WAITING_ROOM_ID;
+  const leftSupport = config.SUPPORT_ROOM_IDS.includes(oldState.channelId) && !config.SUPPORT_ROOM_IDS.includes(newState.channelId ?? '');
 
-  const leftWaiting =
-    oldState.channelId === config.WAITING_ROOM_ID &&
-    newState.channelId !== config.WAITING_ROOM_ID;
+  // ── User joins waiting room ──────────────────────────────────────────────────
+  if (joinedWait) {
+    queueSystem.add(member);
+    console.log(`[Bot] ${member.displayName} joined waiting room — queue size: ${queueSystem.getAll().length}`);
 
-  // Left a support room mid-session
-  const leftSupportRoom =
-    config.SUPPORT_ROOM_IDS.includes(oldState.channelId) &&
-    !config.SUPPORT_ROOM_IDS.includes(newState.channelId);
-
-  if (joinedWaiting) {
-    // Add to queue
-    await queueSystem.add(member);
-    console.log(`[Bot] ${member.user.username} joined waiting room.`);
-
-    // Start waiting audio if not already playing
-    const waitingChannel = guild.channels.cache.get(config.WAITING_ROOM_ID);
-    if (waitingChannel && !audioSystem.isPlayingWaiting) {
-      audioSystem.startWaiting(waitingChannel);
+    // Start waiting music if not already playing
+    const waitCh = guild.channels.cache.get(config.WAITING_ROOM_ID);
+    if (waitCh && !audioSystem.isPlayingWaiting) {
+      audioSystem.startWaiting(waitCh);
     }
 
-    // Run dispatcher
+    // Send DM with room selection
     await dispatcher.dispatch(guild, member);
   }
 
-  if (leftWaiting) {
-    // Remove from queue if they left voluntarily
-    const wasInQueue = await queueSystem.has(member.id);
-    if (wasInQueue) {
-      await queueSystem.remove(member.id);
-      console.log(`[Bot] ${member.user.username} left waiting room — removed from queue.`);
+  // ── User leaves waiting room ─────────────────────────────────────────────────
+  if (leftWait) {
+    const wasQueued = queueSystem.has(member.id);
+    if (wasQueued) {
+      queueSystem.remove(member.id);
+      console.log(`[Bot] ${member.displayName} left waiting room — removed from queue.`);
     }
 
-    // Stop music if nobody left
-    const waitingChannel = guild.channels.cache.get(config.WAITING_ROOM_ID);
-    if (waitingChannel && waitingChannel.members.filter((m) => !m.user.bot).size === 0) {
+    // Stop music if waiting room is empty
+    const waitCh = guild.channels.cache.get(config.WAITING_ROOM_ID);
+    if (waitCh && waitCh.members.filter(m => !m.user.bot).size === 0) {
       audioSystem.stopWaiting();
     }
   }
 
-  if (leftSupportRoom) {
-    // If a Bürger leaves a locked support room unexpectedly, end the session
+  // ── User leaves a support room unexpectedly (not moved by bot) ───────────────
+  if (leftSupport) {
     const activeRooms = dispatcher.getActiveRooms();
-    const session = activeRooms.get(oldState.channelId);
-    if (session && session.citizenId === member.id && member.roles.cache.has(config.BUERGER_ROLE_ID)) {
-      console.log(`[Bot] Citizen ${member.user.username} left support room — ending session.`);
-      await dispatcher.endSupport(oldState.channelId, guild);
+    const session     = activeRooms.get(oldState.channelId);
+    if (session && session.userId === member.id) {
+      console.log(`[Bot] ${member.displayName} left support room — ending session.`);
+      await dispatcher.endSupportOnLeave(oldState.channelId);
     }
   }
 });
 
-// Slash command + button handler
-client.on('interactionCreate', async (interaction) => {
-  // Slash commands
-  if (interaction.isChatInputCommand()) {
-    const command = client.commands.get(interaction.commandName);
-    if (!command) return;
-    try {
-      await command.execute(interaction);
-    } catch (err) {
-      console.error(`[Bot] Command error (${interaction.commandName}):`, err.message);
-      const reply = { content: '❌ Ein Fehler ist aufgetreten.', flags: MessageFlags.Ephemeral };
-      if (interaction.replied || interaction.deferred) {
-        await interaction.editReply(reply).catch(() => {});
-      } else {
-        await interaction.reply(reply).catch(() => {});
-      }
-    }
-    return;
-  }
+// ── Interaction handler ───────────────────────────────────────────────────────
 
-  // Button interactions (come from DMs — no interaction.guild)
-  if (interaction.isButton()) {
-    const { customId } = interaction;
-    try {
-      if (customId.startsWith('room_select:')) {
+client.on('interactionCreate', async (interaction) => {
+  try {
+    // ── Button interactions ────────────────────────────────────────────────────
+    if (interaction.isButton()) {
+      const id = interaction.customId;
+
+      if (id.startsWith('room_request:')) {
         await dispatcher.handleRoomSelect(interaction);
-      } else if (customId.startsWith('support_accept:')) {
-        await dispatcher.handleSupportResponse(interaction, true);
-      } else if (customId.startsWith('support_decline:')) {
-        await dispatcher.handleSupportResponse(interaction, false);
+
+      } else if (id.startsWith('support_accept:')) {
+        await dispatcher.handleSupportAccept(interaction);
+
+      } else if (id.startsWith('support_decline:')) {
+        await dispatcher.handleSupportDecline(interaction);
+
+      } else if (id.startsWith('end_support:')) {
+        await dispatcher.handleEndSupport(interaction);
       }
-    } catch (err) {
-      console.error('[Bot] Button interaction error:', err.message);
-      await interaction.reply({ content: '❌ Fehler bei der Verarbeitung.', flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
     }
+
+    // ── Modal submissions ──────────────────────────────────────────────────────
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId.startsWith('decline_modal:')) {
+        await dispatcher.handleDeclineModal(interaction);
+      }
+      return;
+    }
+
+  } catch (err) {
+    console.error('[Bot] Interaction error:', err);
+    try {
+      const reply = { content: '❌ Ein Fehler ist aufgetreten.', ephemeral: true };
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(reply);
+      } else if (interaction.isButton() || interaction.isModalSubmit()) {
+        await interaction.reply(reply);
+      }
+    } catch {}
   }
 });
 

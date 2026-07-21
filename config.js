@@ -1,9 +1,9 @@
 module.exports = {
-  // Discord IDs
-  WAITING_ROOM_ID: '1512120421007495248',
-  PING_CHANNEL_ID: '1514334207747428572',
+  // ── Discord IDs ─────────────────────────────────────────────────────────────
+  WAITING_ROOM_ID:   '1512120421007495248',
+  PING_CHANNEL_ID:   '1514334207747428572',
   SUPPORTER_ROLE_ID: '1515119690219786250',
-  BUERGER_ROLE_ID: '1514285810889916426',
+  BUERGER_ROLE_ID:   '1514285810889916426',
 
   SUPPORT_ROOM_IDS: [
     '1512122067099844678',
@@ -13,12 +13,7 @@ module.exports = {
     '1514319861243707564',
   ],
 
-  // Timing
-  DISPATCH_DELAY: 10000, // 10 seconds in ms
-
-  // Audio paths
+  // ── Audio ────────────────────────────────────────────────────────────────────
+  // Place waiting.mp3, busy.mp3, offline.mp3 in ./audio/
   AUDIO_PATH: './audio',
-
-  // Dashboard
-  DASHBOARD_PORT: process.env.PORT || 3000,
 };

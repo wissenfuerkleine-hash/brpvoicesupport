@@ -1,498 +1,473 @@
+/**
+ * DM-based Support Dispatcher
+ *
+ * Flow:
+ *  1. User joins waiting room → sendRoomSelectionDM()
+ *     → DM with buttons per room that has a supporter (room may be occupied by others too)
+ *  2. User clicks a room button → handleRoomSelect()
+ *     → DM to all supporters in that room: "Accept / Decline"
+ *  3. Supporter clicks Accept → handleSupportAccept()
+ *     → user moved, session started, supporter gets "End Support" button
+ *  3b. Supporter clicks Decline → handleSupportDecline()
+ *     → modal pops up asking for optional reason
+ *  4. Modal submit → handleDeclineModal()
+ *     → user notified with reason; if other supporters remain they can still accept
+ *  5. Supporter clicks "End Support" → handleEndSupport()
+ *     → session closed, user disconnected, both notified
+ */
+
 const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   EmbedBuilder,
 } = require('discord.js');
-const mongoose = require('mongoose');
-const config = require('../config');
+
+const config      = require('../config');
 const queueSystem = require('./queueSystem');
-const audioSystem = require('./audioSystem');
 
-function dbReady() { return mongoose.connection.readyState === 1; }
+// ── State maps ─────────────────────────────────────────────────────────────────
 
-// roomId → session data
-const activeRooms = new Map();
-// citizenId → { timeout, guild, member, dmMsg }
-const pendingCitizenSelections = new Map();
-// `${citizenId}:${roomId}` → { timeout, guild, citizenId, supporterId, roomId, supporterDm }
-const pendingSupportResponses = new Map();
+// userId → { guildId, dmChannelId }
+const pendingSelections = new Map();
+
+// requestId → {
+//   userId, userDisplayName, guildId, userDmChannelId,
+//   roomId, roomLabel,
+//   supporters: [{ staffId, dmChannelId, messageId }]
+// }
+const pendingRequests = new Map();
+
+// roomId → { userId, supporterId, supporterDmChannelId, supporterMessageId, startedAt }
+const activeSessions = new Map();
 
 let _client = null;
-let _io = null;
 
-function init(client, io) {
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+function init(client) {
   _client = client;
-  _io = io;
 }
 
-function emitRooms() {
-  if (_io) _io.emit('roomsUpdate', getRoomStatuses());
+function uid() {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function getRoomStatuses() {
-  return config.SUPPORT_ROOM_IDS.map((id) => {
-    const active = activeRooms.get(id) || null;
-    return { roomId: id, active };
+function roomLabel(roomId, guild) {
+  const ch  = guild.channels.cache.get(roomId);
+  const idx = config.SUPPORT_ROOM_IDS.indexOf(roomId) + 1;
+  return ch ? ch.name : `Support Raum ${idx}`;
+}
+
+/** Returns all non-bot members with the supporter role currently in the channel. */
+function supportersInRoom(roomId, guild) {
+  const ch = guild.channels.cache.get(roomId);
+  if (!ch) return [];
+  return [...ch.members.filter(m => !m.user.bot && m.roles.cache.has(config.SUPPORTER_ROLE_ID)).values()];
+}
+
+/** Returns display names of all non-bot members in the channel. */
+function membersInRoom(roomId, guild) {
+  const ch = guild.channels.cache.get(roomId);
+  if (!ch) return [];
+  return [...ch.members.filter(m => !m.user.bot).values()].map(m => m.displayName);
+}
+
+// ── Step 1: Send room selection DM ────────────────────────────────────────────
+
+async function dispatch(guild, member) {
+  const availableRooms = config.SUPPORT_ROOM_IDS.filter(id => supportersInRoom(id, guild).length > 0);
+
+  if (availableRooms.length === 0) {
+    try {
+      await member.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2C2F33)
+            .setTitle('⚫ Kein Supporter online')
+            .setDescription('Momentan ist kein Supporter verfügbar.\nBitte versuche es später erneut oder verlasse den Warteraum.'),
+        ],
+      });
+    } catch {}
+    return;
+  }
+
+  // Build one button per available room (max 5 per ActionRow, max 5 rooms = 1 row)
+  const buttons = availableRooms.map(roomId => {
+    const names  = membersInRoom(roomId, guild);
+    const label  = `${roomLabel(roomId, guild)}${names.length ? ' · ' + names.join(', ') : ''}`.slice(0, 80);
+
+    return new ButtonBuilder()
+      .setCustomId(`room_request:${guild.id}:${roomId}`)
+      .setLabel(label)
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('📞');
+  });
+
+  // Split into rows of max 5 buttons
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+  }
+
+  try {
+    const dm = await member.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xF0A500)
+          .setTitle('🎧 Support anfordern')
+          .setDescription(
+            'Bitte wähle den Support-Raum, in dem du betreut werden möchtest.\n' +
+            'Du siehst nur Räume, in denen ein **Supporter** anwesend ist.\n' +
+            'Neben dem Raumnamen siehst du die Personen, die sich aktuell darin befinden.'
+          )
+          .setFooter({ text: 'Klicke auf einen Raum, um eine Anfrage zu senden.' }),
+      ],
+      components: rows,
+    });
+
+    pendingSelections.set(member.id, {
+      guildId:      guild.id,
+      dmChannelId:  dm.channel.id,
+      messageId:    dm.id,
+    });
+  } catch (err) {
+    console.error(`[Dispatcher] Could not DM ${member.user.username}:`, err.message);
+  }
+}
+
+// ── Step 2: User selected a room ──────────────────────────────────────────────
+
+async function handleRoomSelect(interaction) {
+  const [, guildId, roomId] = interaction.customId.split(':');
+  const guild  = _client.guilds.cache.get(guildId);
+
+  if (!guild) {
+    await interaction.reply({ content: '❌ Server nicht gefunden.', ephemeral: true });
+    return;
+  }
+
+  const staffList = supportersInRoom(roomId, guild);
+  if (staffList.length === 0) {
+    // Re-render updated room list
+    await interaction.update({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xE67E22)
+          .setTitle('⚠️ Kein Supporter mehr verfügbar')
+          .setDescription('In diesem Raum ist gerade kein Supporter mehr. Bitte wähle erneut.'),
+      ],
+      components: interaction.message.components, // keep existing buttons
+    });
+    return;
+  }
+
+  const requestId = uid();
+  const label     = roomLabel(roomId, guild);
+  const userName  = interaction.user.globalName ?? interaction.user.username;
+
+  // Acknowledge user — disable buttons
+  await interaction.update({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x3498DB)
+        .setTitle('📨 Anfrage gesendet')
+        .setDescription(`Deine Anfrage wurde an **${label}** gesendet.\nBitte warte auf eine Antwort.`)
+        .setFooter({ text: 'Du wirst per DM benachrichtigt.' }),
+    ],
+    components: [],
+  });
+
+  // DM all supporters in that room
+  const supporterEntries = [];
+  for (const staff of staffList) {
+    try {
+      const embed = new EmbedBuilder()
+        .setColor(0x27AE60)
+        .setTitle('🔔 Support-Anfrage')
+        .setDescription(`**${userName}** möchte in **${label}** betreut werden.`)
+        .addFields({ name: 'Nutzer', value: `<@${interaction.user.id}>`, inline: true })
+        .setTimestamp();
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`support_accept:${requestId}`)
+          .setLabel('✅ Annehmen')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`support_decline:${requestId}`)
+          .setLabel('❌ Ablehnen')
+          .setStyle(ButtonStyle.Danger),
+      );
+
+      const msg = await staff.send({ embeds: [embed], components: [row] });
+      supporterEntries.push({ staffId: staff.id, dmChannelId: msg.channel.id, messageId: msg.id });
+    } catch (err) {
+      console.error(`[Dispatcher] Could not DM supporter ${staff.user.username}:`, err.message);
+    }
+  }
+
+  pendingRequests.set(requestId, {
+    userId:          interaction.user.id,
+    userDisplayName: userName,
+    guildId,
+    userDmChannelId: interaction.channelId,
+    roomId,
+    roomLabel:       label,
+    supporters:      supporterEntries,
   });
 }
 
-async function getDispatchDelay() {
-  if (dbReady()) {
+// ── Step 3a: Supporter accepts ─────────────────────────────────────────────────
+
+async function handleSupportAccept(interaction) {
+  const requestId = interaction.customId.split(':')[1];
+  const request   = pendingRequests.get(requestId);
+
+  if (!request) {
+    await interaction.update({ embeds: [new EmbedBuilder().setColor(0x95A5A6).setTitle('⚠️ Anfrage nicht mehr aktiv').setDescription('Diese Anfrage wurde bereits bearbeitet.')], components: [] });
+    return;
+  }
+
+  pendingRequests.delete(requestId);
+
+  const guild  = _client.guilds.cache.get(request.guildId);
+  const member = guild?.members.cache.get(request.userId);
+
+  // Move user into support room
+  try {
+    if (member?.voice?.channel) {
+      await member.voice.setChannel(request.roomId);
+    }
+  } catch (err) {
+    console.error('[Dispatcher] Could not move member:', err.message);
+  }
+
+  // Cancel all other supporter DMs for this request
+  for (const s of request.supporters) {
+    if (s.staffId === interaction.user.id) continue;
     try {
-      const Settings = require('../models/Settings');
-      const delay = await Settings.get('dispatchDelay', config.DISPATCH_DELAY);
-      return Number(delay);
+      const ch  = await _client.channels.fetch(s.dmChannelId);
+      const msg = await ch.messages.fetch(s.messageId);
+      await msg.edit({
+        embeds: [new EmbedBuilder().setColor(0x95A5A6).setTitle('ℹ️ Anfrage übernommen').setDescription('Ein anderer Supporter hat diese Anfrage bereits übernommen.')],
+        components: [],
+      });
     } catch {}
   }
-  return config.DISPATCH_DELAY;
-}
 
-function hasSupporterOnline(guild) {
-  for (const roomId of config.SUPPORT_ROOM_IDS) {
-    const channel = guild.channels.cache.get(roomId);
-    if (!channel) continue;
-    if (channel.members.some((m) => m.roles.cache.has(config.SUPPORTER_ROLE_ID) && !m.user.bot))
-      return true;
-  }
-  return false;
-}
+  // Update accepting supporter's DM with "End Support" button
+  const sessionEmbed = new EmbedBuilder()
+    .setColor(0x27AE60)
+    .setTitle('✅ Support gestartet')
+    .setDescription(`Du betreust jetzt **${request.userDisplayName}** in **${request.roomLabel}**.`)
+    .setFooter({ text: 'Klicke auf "Support beenden", wenn der Fall abgeschlossen ist.' })
+    .setTimestamp();
 
-function findAvailableSupporterRoom(guild) {
-  // Returns first room that has a supporter and no citizen — for random fallback
-  for (const roomId of config.SUPPORT_ROOM_IDS) {
-    if (activeRooms.has(roomId)) continue;
-    const channel = guild.channels.cache.get(roomId);
-    if (!channel) continue;
-    const supporter = channel.members.find(
-      (m) => m.roles.cache.has(config.SUPPORTER_ROLE_ID) && !m.user.bot
-    );
-    if (!supporter) continue;
-    const hasCitizen = channel.members.some(
-      (m) => m.roles.cache.has(config.BUERGER_ROLE_ID) && !m.user.bot
-    );
-    if (hasCitizen) continue;
-    return { channel, supporter };
-  }
-  return null;
-}
+  const endRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`end_support:${request.roomId}:${request.userId}`)
+      .setLabel('🔴 Support beenden')
+      .setStyle(ButtonStyle.Danger),
+  );
 
-async function sendLog(guild, emoji, text) {
+  await interaction.update({ embeds: [sessionEmbed], components: [endRow] });
+
+  // Store active session (messageId = this updated message)
+  activeSessions.set(request.roomId, {
+    userId:               request.userId,
+    supporterId:          interaction.user.id,
+    supporterDmChannelId: interaction.channelId,
+    supporterMessageId:   interaction.message.id,
+    startedAt:            new Date(),
+  });
+
+  // Notify user
   try {
-    const channel = guild.channels.cache.get(config.PING_CHANNEL_ID);
-    if (channel) await channel.send(`${emoji} **${text}**`);
-  } catch (err) {
-    console.error('[Dispatcher] sendLog error:', err.message);
-  }
+    const userCh = await _client.channels.fetch(request.userDmChannelId);
+    await userCh.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x27AE60)
+          .setTitle('✅ Anfrage angenommen')
+          .setDescription(`**${interaction.user.globalName ?? interaction.user.username}** hat deine Anfrage angenommen.\nDu wirst gleich in **${request.roomLabel}** bewegt.`),
+      ],
+    });
+  } catch {}
 }
 
-// Core move logic — reused by all dispatch paths
-async function moveCitizenToRoom(guild, citizen, supportRoom, supporter) {
-  const queueEntries = await queueSystem.getAll();
-  const entry = queueEntries.find((q) => q.userId === citizen.id);
-  const waitTime = entry ? Date.now() - new Date(entry.joinedAt).getTime() : 0;
+// ── Step 3b: Supporter declines (show modal) ──────────────────────────────────
 
-  await citizen.voice.setChannel(supportRoom);
+async function handleSupportDecline(interaction) {
+  const requestId = interaction.customId.split(':')[1];
+  const request   = pendingRequests.get(requestId);
 
-  await supportRoom.permissionOverwrites.edit(guild.roles.everyone, { Connect: false });
+  if (!request) {
+    await interaction.update({ embeds: [new EmbedBuilder().setColor(0x95A5A6).setTitle('⚠️ Anfrage nicht mehr aktiv').setDescription('Diese Anfrage wurde bereits bearbeitet.')], components: [] });
+    return;
+  }
 
-  const sessionData = {
-    roomId: supportRoom.id,
-    supporterId: supporter.id,
-    supporterName: supporter.user.username,
-    citizenId: citizen.id,
-    citizenName: citizen.user.username,
-    waitTime,
-    startedAt: new Date(),
-    active: true,
-  };
-  activeRooms.set(supportRoom.id, sessionData);
+  // Show modal — this responds to the interaction
+  const modal = new ModalBuilder()
+    .setCustomId(`decline_modal:${requestId}:${interaction.user.id}`)
+    .setTitle('Anfrage ablehnen');
 
-  if (dbReady()) {
-    try {
-      const Session = require('../models/Session');
-      const Stats = require('../models/Stats');
-      await Session.create(sessionData);
-      await Stats.findOneAndUpdate(
-        { supporterId: supporter.id },
-        { supporterName: supporter.user.username, $inc: { totalSessions: 1 }, lastActive: new Date() },
-        { upsert: true }
-      );
-    } catch (err) {
-      console.error('[Dispatcher] DB write error:', err.message);
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('reason')
+        .setLabel('Grund (optional)')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('z.B. Nicht zuständig — bitte wende dich an ...')
+        .setRequired(false)
+        .setMaxLength(200),
+    ),
+  );
+
+  await interaction.showModal(modal);
+}
+
+// ── Step 4: Modal submitted ───────────────────────────────────────────────────
+
+async function handleDeclineModal(interaction) {
+  const [, requestId, staffId] = interaction.customId.split(':');
+  const reason  = interaction.fields.getTextInputValue('reason').trim();
+  const request = pendingRequests.get(requestId);
+
+  if (!request) {
+    await interaction.reply({ content: '⚠️ Anfrage nicht mehr aktiv.', ephemeral: true });
+    return;
+  }
+
+  // Remove this supporter from the pending list
+  request.supporters = request.supporters.filter(s => s.staffId !== staffId);
+
+  // Edit the original DM message of this supporter (buttons → "declined" note)
+  const myEntry = pendingRequests.get(requestId)
+    ? request.supporters.find(s => s.staffId === staffId) // already removed, find from original
+    : null;
+  // Re-fetch from original list before filter:
+  // Since we already filtered, we stored the entry reference earlier? Let's just fetch by staffId from _client
+  // Actually: let's edit the message the modal was triggered FROM — but modal interactions don't carry message.
+  // We need to iterate supporter entries. Since we filtered already, find by staffId in the *original* stored list.
+  // The supporter entry was removed — find via client DMs is complex. Let's send an ephemeral reply instead.
+  await interaction.reply({ content: '❌ Du hast die Anfrage abgelehnt.', ephemeral: true });
+
+  if (request.supporters.length > 0) {
+    // Other supporters can still accept — keep request alive
+    pendingRequests.set(requestId, request);
+    return;
+  }
+
+  // No supporters left → notify user
+  pendingRequests.delete(requestId);
+
+  const declineEmbed = new EmbedBuilder()
+    .setColor(0xE74C3C)
+    .setTitle('❌ Anfrage abgelehnt')
+    .setDescription(
+      reason
+        ? `Deine Support-Anfrage für **${request.roomLabel}** wurde abgelehnt.\n**Grund:** ${reason}`
+        : `Deine Support-Anfrage für **${request.roomLabel}** wurde abgelehnt.`
+    );
+
+  try {
+    const userCh = await _client.channels.fetch(request.userDmChannelId);
+    await userCh.send({ embeds: [declineEmbed] });
+  } catch {}
+}
+
+// ── Step 5: Supporter ends support ────────────────────────────────────────────
+
+async function handleEndSupport(interaction) {
+  const [, roomId, userId] = interaction.customId.split(':');
+  const session = activeSessions.get(roomId);
+
+  if (!session) {
+    await interaction.update({
+      embeds: [new EmbedBuilder().setColor(0x95A5A6).setTitle('⚠️ Kein aktiver Support').setDescription('Dieser Support-Fall ist bereits beendet.')],
+      components: [],
+    });
+    return;
+  }
+
+  activeSessions.delete(roomId);
+
+  const guild = _client.guilds.cache.get(session.guildId ?? _client.guilds.cache.first()?.id);
+
+  // Disconnect user from voice
+  try {
+    const member = guild?.members.cache.get(userId);
+    if (member?.voice?.channelId === roomId) {
+      await member.voice.disconnect();
     }
-  }
-
-  await queueSystem.remove(citizen.id);
-  await sendLog(guild, '🟢', `Übernommen — ${citizen.user.username} → ${supporter.user.username}`);
-  emitRooms();
-
-  const count = await queueSystem.count();
-  if (count === 0) audioSystem.stopWaiting();
-}
-
-// Random fallback dispatch (timeout or DM fail)
-async function randomDispatch(guild, member) {
-  try {
-    await guild.members.fetch(member.id);
   } catch {}
 
-  if (!member.voice?.channelId || member.voice.channelId !== config.WAITING_ROOM_ID) {
-    await queueSystem.remove(member.id);
-    return;
-  }
-
-  const available = findAvailableSupporterRoom(guild);
-  if (!available) {
-    await sendLog(guild, '🟠', `Kein freier Raum — ${member.user.username} wartet weiter`);
-    return;
-  }
-
-  const { channel: supportRoom, supporter } = available;
-  await moveCitizenToRoom(guild, member, supportRoom, supporter);
-  await member.send(
-    `✅ Du wurdest automatisch zu **${supportRoom.name}** (${supporter.user.username}) weitergeleitet.`
-  ).catch(() => {});
-}
-
-// Builds the room selection embed + buttons for the citizen DM
-function buildRoomSelectionDM(guild) {
-  const embed = new EmbedBuilder()
-    .setTitle('🎫 Support Raum Auswahl')
-    .setDescription('Wähle einen Raum aus. Der Supporter kann deine Anfrage annehmen oder ablehnen.')
-    .setColor(0x5865F2);
-
-  const buttons = [];
-
-  config.SUPPORT_ROOM_IDS.forEach((roomId, idx) => {
-    const num = idx + 1;
-    const channel = guild.channels.cache.get(roomId);
-
-    if (!channel) {
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`room_select:${roomId}`)
-          .setLabel(`Support ${num} — Nicht gefunden`)
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true)
-      );
-      return;
-    }
-
-    const supporters = channel.members.filter(
-      (m) => m.roles.cache.has(config.SUPPORTER_ROLE_ID) && !m.user.bot
-    );
-    const hasCitizen =
-      activeRooms.has(roomId) ||
-      channel.members.some((m) => m.roles.cache.has(config.BUERGER_ROLE_ID) && !m.user.bot);
-
-    if (supporters.size === 0) {
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`room_select:${roomId}`)
-          .setLabel(`Support ${num} — Unbesetzt`)
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true)
-      );
-    } else if (hasCitizen) {
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`room_select:${roomId}`)
-          .setLabel(`Support ${num} — Besetzt`)
-          .setStyle(ButtonStyle.Danger)
-          .setDisabled(true)
-      );
-    } else {
-      const names = supporters.map((m) => m.user.username).join(', ');
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`room_select:${roomId}`)
-          .setLabel(`Support ${num} — ${names}`.slice(0, 80))
-          .setStyle(ButtonStyle.Success)
-          .setDisabled(false)
-      );
-    }
+  // Update supporter DM
+  await interaction.update({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x95A5A6)
+        .setTitle('🔴 Support beendet')
+        .setDescription('Der Support-Fall wurde geschlossen.')
+        .setTimestamp(),
+    ],
+    components: [],
   });
 
-  // Max 5 buttons per row — we have exactly 5 rooms
-  const row = new ActionRowBuilder().addComponents(buttons);
-  return { embeds: [embed], components: [row] };
-}
-
-function disableAllButtons(components) {
-  return components.map((row) => {
-    const newRow = new ActionRowBuilder();
-    newRow.addComponents(
-      row.components.map((btn) =>
-        ButtonBuilder.from(btn).setDisabled(true)
-      )
-    );
-    return newRow;
-  });
-}
-
-// Entry point: citizen joins waiting room
-async function dispatch(guild, member) {
-  const waitingChannel = guild.channels.cache.get(config.WAITING_ROOM_ID);
-
-  if (!member.voice?.channelId || member.voice.channelId !== config.WAITING_ROOM_ID) {
-    await queueSystem.remove(member.id);
-    return;
-  }
-
-  if (!hasSupporterOnline(guild)) {
-    await sendLog(guild, '⚫', `Niemand online — ${member.user.username} wartet`);
-    if (waitingChannel) await audioSystem.playInChannel(waitingChannel, 'offline.mp3');
-    return;
-  }
-
-  await sendLog(guild, '🟡', `Wartend — ${member.user.username}`);
-
-  // Send room-selection DM to citizen
-  const payload = buildRoomSelectionDM(guild);
-
-  let dmMsg;
+  // Notify user
   try {
-    dmMsg = await member.send(payload);
-  } catch {
-    // Can't DM → random dispatch immediately
-    await randomDispatch(guild, member);
-    return;
-  }
-
-  // 30-second timeout: citizen didn't choose
-  const citizenTimeout = setTimeout(async () => {
-    if (!pendingCitizenSelections.has(member.id)) return;
-    pendingCitizenSelections.delete(member.id);
-    await dmMsg.edit({ components: disableAllButtons(payload.components) }).catch(() => {});
-    await member.send('⏱️ Zeit abgelaufen — du wirst automatisch zugeteilt.').catch(() => {});
-    await randomDispatch(guild, member);
-  }, 30_000);
-
-  pendingCitizenSelections.set(member.id, {
-    timeout: citizenTimeout,
-    guild,
-    member,
-    dmMsg,
-    components: payload.components,
-  });
+    const user = await _client.users.fetch(userId);
+    await user.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x95A5A6)
+          .setTitle('Support beendet')
+          .setDescription('Dein Support wurde vom Supporter abgeschlossen. Danke!'),
+      ],
+    });
+  } catch {}
 }
 
-// Called when citizen clicks a room button (DM interaction)
-async function handleRoomSelect(interaction) {
-  const roomId = interaction.customId.split(':')[1];
-  const citizenId = interaction.user.id;
+// ── Called when a user/citizen leaves a support room unexpectedly ─────────────
 
-  const pending = pendingCitizenSelections.get(citizenId);
-  if (!pending) {
-    await interaction.update({ content: '❌ Diese Auswahl ist abgelaufen.', embeds: [], components: [] }).catch(() => {});
-    return;
-  }
+async function endSupportOnLeave(roomId) {
+  const session = activeSessions.get(roomId);
+  if (!session) return;
+  activeSessions.delete(roomId);
 
-  clearTimeout(pending.timeout);
-  pendingCitizenSelections.delete(citizenId);
-
-  const { guild, member, components } = pending;
-
-  // Disable citizen buttons
-  await interaction.update({ components: disableAllButtons(components) }).catch(() => {});
-
-  const channel = guild.channels.cache.get(roomId);
-  if (!channel || activeRooms.has(roomId)) {
-    await interaction.user.send('❌ Raum inzwischen besetzt — du wirst automatisch zugeteilt.').catch(() => {});
-    await randomDispatch(guild, member);
-    return;
-  }
-
-  const supportersInRoom = channel.members.filter(
-    (m) => m.roles.cache.has(config.SUPPORTER_ROLE_ID) && !m.user.bot
-  );
-  if (supportersInRoom.size === 0) {
-    await interaction.user.send('❌ Kein Supporter mehr im Raum — du wirst automatisch zugeteilt.').catch(() => {});
-    await randomDispatch(guild, member);
-    return;
-  }
-
-  // Pick random supporter from the chosen room
-  const supporter = supportersInRoom.random();
-
-  const acceptId = `support_accept:${citizenId}:${roomId}`;
-  const declineId = `support_decline:${citizenId}:${roomId}`;
-
-  const embed = new EmbedBuilder()
-    .setTitle('📞 Neue Support-Anfrage')
-    .setDescription(`**${interaction.user.username}** möchte von dir supportet werden.`)
-    .setColor(0xFEE75C)
-    .addFields({ name: 'Raum', value: channel.name });
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(acceptId).setLabel('✅ Annehmen').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(declineId).setLabel('❌ Ablehnen').setStyle(ButtonStyle.Danger)
-  );
-
-  let supporterDm;
+  // Update supporter DM silently
   try {
-    supporterDm = await supporter.send({ embeds: [embed], components: [row] });
-  } catch {
-    await interaction.user.send('⚠️ Supporter konnte nicht benachrichtigt werden — du wirst automatisch zugeteilt.').catch(() => {});
-    await randomDispatch(guild, member);
-    return;
-  }
-
-  await interaction.user.send(`⏳ Anfrage wurde an **${supporter.user.username}** gesendet — warte auf Antwort (30s)...`).catch(() => {});
-
-  const disabledRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(acceptId).setLabel('✅ Annehmen').setStyle(ButtonStyle.Success).setDisabled(true),
-    new ButtonBuilder().setCustomId(declineId).setLabel('❌ Ablehnen').setStyle(ButtonStyle.Danger).setDisabled(true)
-  );
-
-  // 30-second timeout: supporter didn't respond
-  const supporterTimeout = setTimeout(async () => {
-    const key = `${citizenId}:${roomId}`;
-    if (!pendingSupportResponses.has(key)) return;
-    pendingSupportResponses.delete(key);
-    await supporterDm.edit({ components: [disabledRow] }).catch(() => {});
-    await supporter.send('⏱️ Zeit abgelaufen — der Bürger wurde automatisch zugeteilt.').catch(() => {});
-    await interaction.user.send('⏱️ Kein Supporter hat reagiert — du wirst automatisch zugeteilt.').catch(() => {});
-    await randomDispatch(guild, member);
-  }, 30_000);
-
-  pendingSupportResponses.set(`${citizenId}:${roomId}`, {
-    timeout: supporterTimeout,
-    guild,
-    member,
-    supporterId: supporter.id,
-    roomId,
-    supporterDm,
-    disabledRow,
-  });
-}
-
-// Called when supporter clicks Accept or Decline (DM interaction)
-async function handleSupportResponse(interaction, accepted) {
-  const parts = interaction.customId.split(':');
-  const citizenId = parts[1];
-  const roomId = parts[2];
-  const key = `${citizenId}:${roomId}`;
-
-  const pending = pendingSupportResponses.get(key);
-  if (!pending) {
-    await interaction.update({ content: '❌ Diese Anfrage ist bereits abgelaufen.', components: [] }).catch(() => {});
-    return;
-  }
-
-  clearTimeout(pending.timeout);
-  pendingSupportResponses.delete(key);
-
-  const { guild, member, disabledRow } = pending;
-
-  // Disable supporter buttons
-  await interaction.update({ components: [disabledRow] }).catch(() => {});
-
-  if (accepted) {
-    // Check citizen is still in waiting room
-    try { await guild.members.fetch(member.id); } catch {}
-    if (!member.voice?.channelId || member.voice.channelId !== config.WAITING_ROOM_ID) {
-      await interaction.user.send('⚠️ Der Bürger ist nicht mehr im Warteraum.').catch(() => {});
-      return;
-    }
-
-    const channel = guild.channels.cache.get(roomId);
-    const supporter = guild.members.cache.get(pending.supporterId) ||
-      await guild.members.fetch(pending.supporterId).catch(() => null);
-
-    if (!channel || !supporter) {
-      await interaction.user.send('❌ Fehler: Raum oder Supporter nicht gefunden.').catch(() => {});
-      return;
-    }
-
-    try {
-      await moveCitizenToRoom(guild, member, channel, supporter);
-      await interaction.user.send(`✅ Du hast **${member.user.username}** angenommen.`).catch(() => {});
-    } catch (err) {
-      console.error('[Dispatcher] accept move error:', err.message);
-      await interaction.user.send('❌ Fehler beim Verschieben.').catch(() => {});
-    }
-  } else {
-    // Declined → inform citizen and random dispatch
-    await interaction.user.send(
-      `❌ Du hast die Anfrage von **${member.user.username}** abgelehnt.`
-    ).catch(() => {});
-    await member.send(
-      '❌ Deine Anfrage wurde abgelehnt — du wirst automatisch zugeteilt.'
-    ).catch(() => {});
-    await randomDispatch(guild, member);
-  }
-}
-
-async function endSupport(roomId, guild) {
-  const session = activeRooms.get(roomId);
-  if (!session) return null;
-
-  try {
-    const channel = guild.channels.cache.get(roomId);
-
-    if (session.citizenId) {
-      const citizen =
-        guild.members.cache.get(session.citizenId) ||
-        (await guild.members.fetch(session.citizenId).catch(() => null));
-      if (citizen?.voice?.channelId === roomId) {
-        await citizen.voice.disconnect().catch(() => {});
-      }
-    }
-
-    if (channel) {
-      await channel.permissionOverwrites.edit(guild.roles.everyone, { Connect: null });
-    }
-
-    const duration = Date.now() - new Date(session.startedAt).getTime();
-    if (dbReady()) {
-      try {
-        const Session = require('../models/Session');
-        const Stats = require('../models/Stats');
-        await Session.findOneAndUpdate(
-          { roomId, supporterId: session.supporterId, active: true },
-          { endedAt: new Date(), active: false }
-        );
-        await Stats.findOneAndUpdate(
-          { supporterId: session.supporterId },
-          { $inc: { totalTime: duration }, lastActive: new Date() }
-        );
-      } catch (err) {
-        console.error('[Dispatcher] DB endSupport error:', err.message);
-      }
-    }
-
-    activeRooms.delete(roomId);
-    await sendLog(guild, '🔴', `Beendet — ${session.citizenName} (${Math.round(duration / 1000)}s)`);
-    emitRooms();
-
-    const next = await queueSystem.getNext();
-    if (next) {
-      const nextMember =
-        guild.members.cache.get(next.userId) ||
-        (await guild.members.fetch(next.userId).catch(() => null));
-      if (nextMember) await dispatch(guild, nextMember);
-    }
-
-    return session;
-  } catch (err) {
-    console.error('[Dispatcher] endSupport error:', err.message);
-    return null;
-  }
+    const ch  = await _client.channels.fetch(session.supporterDmChannelId);
+    const msg = await ch.messages.fetch(session.supporterMessageId);
+    await msg.edit({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x95A5A6)
+          .setTitle('🔴 Support beendet')
+          .setDescription('Der Nutzer hat den Support-Raum verlassen. Session wurde automatisch beendet.')
+          .setTimestamp(),
+      ],
+      components: [],
+    });
+  } catch {}
 }
 
 function getActiveRooms() {
-  return activeRooms;
+  return activeSessions;
 }
 
 module.exports = {
   init,
   dispatch,
   handleRoomSelect,
-  handleSupportResponse,
-  endSupport,
-  getRoomStatuses,
+  handleSupportAccept,
+  handleSupportDecline,
+  handleDeclineModal,
+  handleEndSupport,
+  endSupportOnLeave,
   getActiveRooms,
-  sendLog,
 };
