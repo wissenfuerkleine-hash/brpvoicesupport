@@ -45,12 +45,12 @@ class DiscordBot(commands.Bot):
             except Exception as e:
                 logger.error("Failed to load cog %s: %s", cog, e, exc_info=True)
 
-        logger.info("Syncing slash commands...")
+        logger.info("Syncing slash commands globally...")
         try:
             synced = await self.tree.sync()
-            logger.info("Synced %d slash commands.", len(synced))
+            logger.info("Synced %d global slash commands.", len(synced))
         except Exception as e:
-            logger.error("Failed to sync commands: %s", e, exc_info=True)
+            logger.error("Failed to sync global commands: %s", e, exc_info=True)
 
         self.stats_task.start()
 
@@ -62,6 +62,15 @@ class DiscordBot(commands.Bot):
                 name=f"{len(self.guilds)} Server | /help",
             )
         )
+
+        # Sync commands to each guild immediately (instant, no 1h wait)
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("Synced commands to guild: %s", guild.name)
+            except Exception as e:
+                logger.warning("Could not sync to guild %s: %s", guild.name, e)
 
         async with AsyncSessionLocal() as db:
             for guild in self.guilds:

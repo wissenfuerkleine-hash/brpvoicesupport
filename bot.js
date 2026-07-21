@@ -48,14 +48,27 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     queueSystem.add(member);
     console.log(`[Bot] ${member.displayName} joined waiting room — queue size: ${queueSystem.getAll().length}`);
 
-    // Start waiting music if not already playing
+    // Start waiting music in voice channel (random file, loops)
     const waitCh = guild.channels.cache.get(config.WAITING_ROOM_ID);
     if (waitCh && !audioSystem.isPlayingWaiting) {
       audioSystem.startWaiting(waitCh);
     }
 
-    // Send DM with room selection
+    // Send DM with room selection + random audio file attachment
     await dispatcher.dispatch(guild, member);
+
+    // Send a random audio file from /audio as DM so the user can listen
+    const audioFile = audioSystem.getRandomFilePath();
+    if (audioFile) {
+      try {
+        await member.send({
+          content: '🎵 Hier ist etwas Musik für die Wartezeit:',
+          files: [audioFile],
+        });
+      } catch (err) {
+        console.error(`[Bot] Could not send audio DM to ${member.displayName}:`, err.message);
+      }
+    }
   }
 
   // ── User leaves waiting room ─────────────────────────────────────────────────

@@ -282,6 +282,7 @@ async function handleSupportAccept(interaction) {
     supporterId:          interaction.user.id,
     supporterDmChannelId: interaction.channelId,
     supporterMessageId:   interaction.message.id,
+    guildId:              request.guildId,
     startedAt:            new Date(),
   });
 
@@ -398,13 +399,15 @@ async function handleEndSupport(interaction) {
 
   const guild = _client.guilds.cache.get(session.guildId ?? _client.guilds.cache.first()?.id);
 
-  // Disconnect user from voice
+  // Disconnect user from the support room voice channel
   try {
-    const member = guild?.members.cache.get(userId);
+    const member = await guild?.members.fetch(userId);
     if (member?.voice?.channelId === roomId) {
       await member.voice.disconnect();
     }
-  } catch {}
+  } catch (err) {
+    console.error('[Dispatcher] Could not disconnect member:', err.message);
+  }
 
   // Update supporter DM
   await interaction.update({
