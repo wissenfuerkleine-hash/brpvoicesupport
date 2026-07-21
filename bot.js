@@ -54,21 +54,8 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       audioSystem.startWaiting(waitCh);
     }
 
-    // Send DM with room selection + random audio file attachment
+    // Send DM with room selection
     await dispatcher.dispatch(guild, member);
-
-    // Send a random audio file from /audio as DM so the user can listen
-    const audioFile = audioSystem.getRandomFilePath();
-    if (audioFile) {
-      try {
-        await member.send({
-          content: '🎵 Hier ist etwas Musik für die Wartezeit:',
-          files: [audioFile],
-        });
-      } catch (err) {
-        console.error(`[Bot] Could not send audio DM to ${member.displayName}:`, err.message);
-      }
-    }
   }
 
   // ── User leaves waiting room ─────────────────────────────────────────────────

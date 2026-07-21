@@ -19,15 +19,99 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 
 TOXIC_WORDS: set = {
+    # English — insults
     "idiot", "stupid", "moron", "dumb", "retard", "retarded", "imbecile",
     "asshole", "bastard", "bitch", "cunt", "dick", "fuck", "fucking", "shit",
-    "damn", "hell", "piss", "cock", "pussy", "whore", "slut", "faggot", "fag",
+    "damn", "piss", "cock", "pussy", "whore", "slut", "faggot", "fag",
     "nigger", "nigga", "kike", "spic", "chink", "gook", "towelhead", "wetback",
-    "nazi", "kill yourself", "kys", "die", "rape", "rapist",
-    # German toxic words
-    "idiot", "trottel", "arschloch", "scheiße", "scheiß", "hurensohn",
-    "wichser", "fotze", "nutte", "schwuchtel", "neger", "spast",
+    "nazi", "kill yourself", "kys", "rape", "rapist", "loser", "pathetic",
+    "screw you", "go to hell", "shut up", "son of a bitch",
+    # German — Schimpfwörter (Basisformen)
+    "fick", "ficken", "gefickt", "ficker", "fick dich", "verpiss dich",
+    "arschloch", "arsch", "arschgesicht", "arschkopf", "arschkriecher",
+    "scheiße", "scheiß", "scheisskopf", "scheißkerl", "scheisskerl",
+    "scheisskind", "scheiße", "sheiße",
+    "hurensohn", "hurenbock", "hure", "nutte", "huso",
+    "wichser", "wichsen", "gewichst", "wichsvorlage",
+    "fotze", "fotzig",
+    "schwuchtel", "schwuler", "schwul",
+    "neger", "negerino",
+    "spast", "spasti", "spastisch",
+    "trottel", "vollidiot", "blödmann", "blödkopf", "blöde kuh", "blöd",
+    "depp", "deppenaffe", "deppen",
+    "dreckskerl", "drecksau", "dreckstück", "dreck",
+    "idiot", "idiotin", "vollidiotin",
+    "wichsgesicht", "wichskopf",
+    "pisser", "pissnelke", "pisskerl",
+    "verpisst", "verpiss",
+    "halt die fresse", "halt die klappe", "halt dein maul", "halt maul",
+    "fresse", "schnauze", "maul",
+    "dummkopf", "dummkopf", "dumm", "dummheit",
+    "penner", "pennerin", "pennerkind",
+    "stricher", "stricherin",
+    "kacknoob", "kacke", "kacken", "kacker",
+    "missgeburt", "missgeburt",
+    "kanake", "kanacke",
+    "opfer", "los opfer",
+    "hurenkind", "hurenmutter",
+    "schlampe", "schlampen", "schlampig",
+    "vögeln", "vögel",
+    "bastard", "bastarde",
+    "du gehst mir auf die nerven",
+    "lass mich in ruhe",
+    "leck mich", "leck mich am arsch", "leckmich",
+    "du kannst mich mal", "kannst mich mal",
+    "verarscht", "verarsch", "verarschen",
+    "dummfotze", "dumme fotze",
+    "wixxer", "wixxen",
+    "sohn einer hure", "sohn einer nutte",
+    "mach dich vom acker", "mach dich weg",
+    "fahr zur hölle", "geh zur hölle", "zur hölle",
+    "töte dich", "bring dich um",
+    "loser", "versager", "versagerin",
+    "kleinkrimineller", "kriminell",
+    "scheiß ab", "scheiß drauf",
+    "ruf mich nicht an", "nerv mich nicht",
+    "du nervst", "nervensäge",
+    "affe", "affenkind", "affentrottel",
+    "vollpfosten", "pfosten",
+    "megaidiot", "superidiot",
+    "gönn dir einen strick", "strick dir einen",
+    "hirntot", "hirnlos", "hirnfrei",
+    "beschissen", "beschissenheit",
+    "kotzbrocken", "kotzbroken",
+    "ekelpaket",
+    "schwachkopf", "schwachköpfig",
+    "wichsmonster",
+    "dreckspack", "drecksmann",
+    "flittchen",
+    "luder",
+    "göre",
+    "miststück", "mist",
 }
+
+# German leet speak / obfuscation variants
+TOXIC_PATTERNS: List[str] = [
+    r"f[i1!][c(][k]+",           # fick, f1ck, f!ck
+    r"sch[e3][i1!][sß$]+",       # scheiss, sch3iß
+    r"ar[s$][c(]hl[o0]ch",       # arschloch variants
+    r"w[i1!]ch[s$]",             # wichs, w1chs
+    r"hur[e3]n[s$][o0]hn",       # hurensohn variants
+    r"f[o0]tz[e3]",              # fotze variants
+    r"v[e3]rp[i1!][s$][s$]",     # verpiss variants
+    r"n[u\*][t+][t+][e3]",       # nutte variants
+    r"schl[a@]mp[e3]",           # schlampe variants
+    r"kack[e3]",                 # kacke variants
+    r"d[e3]pp[e3n]?",            # depp variants
+    r"[a@]ff[e3]",               # affe variants
+    r"[i1!]d[i1!][o0]t",         # idiot variants
+    r"spas?t[i1!]?",             # spasti variants
+    r"fuck|f\*ck|f\.ck|fck",
+    r"sh[i1!]t|sh\*t",
+    r"b[i1!]tch",
+    r"c[u\*]nt",
+    r"a[s$][s$]h[o0]l[e3]",
+]
 
 DISCRIMINATION_WORDS: set = {
     "gay", "lesbian", "tranny", "trannies", "homo", "dyke",
@@ -211,27 +295,65 @@ def _analyze_char_spam(content: str) -> Tuple[float, List[str]]:
     return 0.0, []
 
 
-def _analyze_toxic_language(content: str) -> Tuple[float, List[str]]:
-    """Detect toxic, offensive, discriminatory language."""
-    content_lower = content.lower()
-    words = re.findall(r"\b\w+\b", content_lower)
-    word_set = set(words)
+def _normalize_text(text: str) -> str:
+    """Normalize obfuscation tricks: leet speak, repeated chars, zero-width chars."""
+    text = text.lower()
+    # Remove zero-width and invisible chars
+    text = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff]", "", text)
+    # Leet speak substitutions
+    leet = {"@": "a", "4": "a", "3": "e", "1": "i", "!": "i", "0": "o",
+            "$": "s", "5": "s", "7": "t", "+": "t", "8": "b", "ß": "ss"}
+    for k, v in leet.items():
+        text = text.replace(k, v)
+    # Collapse repeated chars: "fiiick" → "fick", "scheeeiße" → "scheisse"
+    text = re.sub(r"(.)\1{2,}", r"\1\1", text)
+    return text
 
-    toxic_hits = word_set & TOXIC_WORDS
-    disc_hits = word_set & DISCRIMINATION_WORDS
+
+def _analyze_toxic_language(content: str) -> Tuple[float, List[str]]:
+    """Detect toxic, offensive, discriminatory language (DE + EN)."""
+    content_lower = content.lower()
+    content_norm = _normalize_text(content)
 
     score = 0.0
     flags = []
+    hit_count = 0
 
-    # Check bigrams for phrases like "kill yourself"
+    # 1) Exact word / phrase matching (handles German Umlaute correctly)
+    #    Split on whitespace + punctuation but keep Umlaute
+    words = re.findall(r"[a-zäöüß]+", content_lower)
+    word_set = set(words)
+
+    # Unigram hits
+    toxic_hits = word_set & TOXIC_WORDS
+    hit_count += len(toxic_hits)
+
+    # Bigram hits (phrases like "fick dich", "kill yourself")
     bigrams = {f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)}
-    phrase_hits = bigrams & TOXIC_WORDS
-    toxic_hits |= phrase_hits
+    # Trigram hits
+    trigrams = {f"{words[i]} {words[i+1]} {words[i+2]}" for i in range(len(words) - 2)}
+    phrase_hits = (bigrams | trigrams) & TOXIC_WORDS
+    hit_count += len(phrase_hits)
 
-    if toxic_hits:
-        score += min(len(toxic_hits) * 20, 80.0)
-        flags.append(f"toxic_language:{len(toxic_hits)}_terms")
+    # Also check normalized text for same words
+    words_norm = re.findall(r"[a-zäöüß]+", content_norm)
+    word_set_norm = set(words_norm)
+    norm_hits = word_set_norm & TOXIC_WORDS
+    hit_count += len(norm_hits - word_set)  # only new hits
 
+    # 2) Regex pattern matching for obfuscated / leet variants
+    pattern_hits = 0
+    for pattern in TOXIC_PATTERNS:
+        if re.search(pattern, content_norm, re.IGNORECASE):
+            pattern_hits += 1
+    hit_count += pattern_hits
+
+    if hit_count > 0:
+        score += min(hit_count * 22, 90.0)
+        flags.append(f"toxic_language:{hit_count}_terms")
+
+    # 3) Discrimination word check
+    disc_hits = word_set & DISCRIMINATION_WORDS
     if disc_hits:
         score += min(len(disc_hits) * 10, 30.0)
         flags.append(f"potentially_discriminatory:{len(disc_hits)}_terms")
